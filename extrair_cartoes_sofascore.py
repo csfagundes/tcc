@@ -39,22 +39,38 @@ MAX_RETRIES     = 4
 BASE = "https://api.sofascore.com/api/v1"
 
 HEADERS = {
-    "Accept"          : "application/json, text/plain, */*",
-    "Accept-Language" : "pt-BR,pt;q=0.9",
-    "Referer"         : "https://www.sofascore.com/",
-    "Origin"          : "https://www.sofascore.com",
+    "User-Agent"                : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept"                    : "application/json, text/plain, */*",
+    "Accept-Language"           : "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding"           : "gzip, deflate, br",
+    "Referer"                   : "https://www.sofascore.com/",
+    "Origin"                    : "https://www.sofascore.com",
+    "Sec-Ch-Ua"                 : '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile"          : "?0",
+    "Sec-Ch-Ua-Platform"        : '"Windows"',
+    "Sec-Fetch-Dest"            : "empty",
+    "Sec-Fetch-Mode"            : "cors",
+    "Sec-Fetch-Site"            : "same-site",
+    "Cache-Control"             : "no-cache",
+    "Pragma"                    : "no-cache",
 }
 
-# Create a cloudscraper session (bypasses Cloudflare JS challenges)
-scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "mobile": False}
-)
-scraper.headers.update(HEADERS)
+def make_scraper():
+    """Create a fresh cloudscraper session (refreshes Cloudflare cookies)."""
+    s = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    s.headers.update(HEADERS)
+    return s
+
+# Create initial session
+scraper = make_scraper()
 
 
 # ── HTTP GET with retry logic ───────────────────────────────────────────────
 def get(url):
     """GET with retry logic. Returns parsed JSON or None on 404/failure."""
+    global scraper
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = scraper.get(url, timeout=20)
@@ -63,11 +79,14 @@ def get(url):
             elif r.status_code == 404:
                 return None   # not an error — match/round simply doesn't exist
             elif r.status_code == 429:
-                print(f"    [429] Rate limited — waiting 45s (attempt {attempt}/{MAX_RETRIES})...")
-                time.sleep(45)
+                wait = 60 * attempt
+                print(f"    [429] Rate limited — waiting {wait}s (attempt {attempt}/{MAX_RETRIES})...")
+                time.sleep(wait)
             elif r.status_code == 403:
-                print(f"    [403] Forbidden — waiting 20s (attempt {attempt}/{MAX_RETRIES})...")
-                time.sleep(20)
+                wait = 30 * attempt
+                print(f"    [403] Blocked — refreshing session and waiting {wait}s (attempt {attempt}/{MAX_RETRIES})...")
+                scraper = make_scraper()   # fresh Cloudflare cookies
+                time.sleep(wait)
             else:
                 print(f"    [HTTP {r.status_code}] {url} — waiting 5s (attempt {attempt}/{MAX_RETRIES})")
                 time.sleep(5)
