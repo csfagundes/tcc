@@ -3,6 +3,7 @@
 BRASILEIRÃO SÉRIE A — CARD EVENTS EXTRACTOR (2018–2023)
 Source  : SofaScore unofficial API  (tournament ID = 325)
 Output  : cartoes_brasileirao_2018_2023.csv
+          jogadores_unicos_com_foto.csv
 
 Columns in output:
     season, match_date, match_id, round,
@@ -12,104 +13,114 @@ Columns in output:
     card_type,   ← yellow | red | yellow_red
     minute, minute_extra,
     score_home_at_card, score_away_at_card,
-    player_photo_url     ← ready to feed straight into Claude Vision
+    player_photo_url
 
-Key advantage over FBref approach:
-    player_id is the NATIVE SofaScore ID — photo URL is simply
-    https://api.sofascore.com/api/v1/player/{player_id}/image
-    No name-matching, no search calls, zero ambiguity.
-
-Runtime : ~45–90 min for ~2280 matches (polite 1.5s delay between calls)
+Runtime : ~1–2 hours for ~2280 matches (2s delay + jitter between calls)
 =============================================================================
 """
 
-import requests
+import cloudscraper
 import time
+import random
 import json
 import csv
 import os
 from datetime import datetime
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+# ── CONFIG ─────────────────────────────────────────────────────────────────
 TOURNAMENT_ID   = 325          # Brasileirão Série A
 TARGET_YEARS    = [2018, 2019, 2020, 2021, 2022, 2023]
-DELAY_MATCH     = 1.5          # seconds between match calls (Cloudflare limit)
+DELAY_MATCH     = 2.0          # base seconds between match calls
 DELAY_ROUND     = 0.8          # seconds between round calls
 OUTPUT_FILE     = "cartoes_brasileirao_2018_2023.csv"
 CHECKPOINT_FILE = "checkpoint_processed_matches.json"
+MAX_RETRIES     = 4
 
-BASE  = "https://api.sofascore.com/api/v1"
+BASE = "https://api.sofascore.com/api/v1"
+
 HEADERS = {
-    "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
     "Accept"          : "application/json, text/plain, */*",
-    "Accept-Language" : "en-US,en;q=0.9",
+    "Accept-Language" : "pt-BR,pt;q=0.9",
     "Referer"         : "https://www.sofascore.com/",
     "Origin"          : "https://www.sofascore.com",
 }
 
-def get(url, retries=3):
-    """GET with retry logic."""
-    for attempt in range(retries):
+# Create a cloudscraper session (bypasses Cloudflare JS challenges)
+scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+)
+scraper.headers.update(HEADERS)
+
+
+# ── HTTP GET with retry logic ───────────────────────────────────────────────
+def get(url):
+    """GET with retry logic. Returns parsed JSON or None on 404/failure."""
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
+            r = scraper.get(url, timeout=20)
             if r.status_code == 200:
                 return r.json()
+            elif r.status_code == 404:
+                return None   # not an error — match/round simply doesn't exist
             elif r.status_code == 429:
-                print(f"    Rate limited — waiting 30s...")
-                time.sleep(30)
+                print(f"    [429] Rate limited — waiting 45s (attempt {attempt}/{MAX_RETRIES})...")
+                time.sleep(45)
             elif r.status_code == 403:
-                print(f"    403 Cloudflare block — waiting 60s...")
-                time.sleep(60)
+                print(f"    [403] Forbidden — waiting 20s (attempt {attempt}/{MAX_RETRIES})...")
+                time.sleep(20)
             else:
-                print(f"    HTTP {r.status_code} for {url}")
+                print(f"    [HTTP {r.status_code}] {url} — waiting 5s (attempt {attempt}/{MAX_RETRIES})")
                 time.sleep(5)
         except Exception as e:
-            print(f"    Request error: {e} — retry {attempt+1}/{retries}")
+            print(f"    [Error] {e} — retry {attempt}/{MAX_RETRIES}")
             time.sleep(5)
     return None
 
-# ── STEP 1: GET ALL SEASON IDs ────────────────────────────────────────────────
+
+# ── STEP 1: GET ALL SEASON IDs ──────────────────────────────────────────────
 def get_seasons():
     print("\n[1/4] Fetching season IDs for tournament 325 (Brasileirão Série A)...")
     data = get(f"{BASE}/unique-tournament/{TOURNAMENT_ID}/seasons")
     if not data:
-        raise RuntimeError("Could not fetch seasons")
+        raise RuntimeError("Could not fetch seasons list — check connectivity.")
 
     seasons = {}
     for s in data.get("seasons", []):
-        year = s.get("year")
-        sid  = s.get("id")
-        # SofaScore stores year as "2018" or "18/19" — filter by target years
+        year_raw = s.get("year", "")
+        sid      = s.get("id")
         try:
-            if int(str(year)[:4]) in TARGET_YEARS:
-                seasons[int(str(year)[:4])] = sid
-                print(f"  Season {year} → ID {sid}")
-        except Exception:
+            year_int = int(str(year_raw)[:4])
+            if year_int in TARGET_YEARS:
+                seasons[year_int] = sid
+                print(f"  Season {year_raw!r} → ID {sid}")
+        except (ValueError, TypeError):
             pass
 
     if not seasons:
-        raise RuntimeError("No matching seasons found. Check TARGET_YEARS or tournament ID.")
+        raise RuntimeError("No matching seasons found — check TARGET_YEARS or tournament ID.")
     return seasons
 
-# ── STEP 2: GET ALL MATCH IDs PER SEASON (via rounds) ────────────────────────
-def get_match_ids_for_season(season_id, year):
-    print(f"\n[2/4] Collecting match IDs for season {year} (season_id={season_id})...")
-    matches = []
-    round_n = 1
 
-    while True:
+# ── STEP 2: GET ALL MATCH IDs PER SEASON (via rounds) ──────────────────────
+def get_match_ids_for_season(season_id, year):
+    print(f"\n[2/4] Collecting match IDs — season {year} (season_id={season_id})...")
+    matches = []
+
+    for round_n in range(1, 39):   # Série A has exactly 38 rounds
         url  = f"{BASE}/unique-tournament/{TOURNAMENT_ID}/season/{season_id}/events/round/{round_n}"
         data = get(url)
+
         if not data or not data.get("events"):
-            # No more rounds
+            print(f"  Round {round_n:2d}: no events — stopping")
             break
 
         for event in data["events"]:
+            ts = event.get("startTimestamp", 0)
             matches.append({
                 "season"      : year,
                 "match_id"    : event["id"],
                 "round"       : round_n,
-                "match_date"  : datetime.fromtimestamp(event.get("startTimestamp", 0)).strftime("%Y-%m-%d"),
+                "match_date"  : datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d") if ts else "",
                 "home_team"   : event.get("homeTeam", {}).get("name", ""),
                 "home_team_id": event.get("homeTeam", {}).get("id", ""),
                 "away_team"   : event.get("awayTeam", {}).get("name", ""),
@@ -117,17 +128,13 @@ def get_match_ids_for_season(season_id, year):
             })
 
         print(f"  Round {round_n:2d}: {len(data['events'])} matches")
-        round_n += 1
         time.sleep(DELAY_ROUND)
-
-        # Safety cap — Série A has 38 rounds
-        if round_n > 40:
-            break
 
     print(f"  → {len(matches)} matches found for {year}")
     return matches
 
-# ── STEP 3: EXTRACT CARD INCIDENTS FROM EACH MATCH ───────────────────────────
+
+# ── STEP 3: EXTRACT CARD INCIDENTS FROM EACH MATCH ─────────────────────────
 CARD_TYPE_MAP = {
     "yellow"    : "yellow",
     "red"       : "red",
@@ -142,65 +149,70 @@ def extract_cards_from_match(match):
 
     cards = []
     for inc in data.get("incidents", []):
-        inc_type  = inc.get("incidentType", "")
-        inc_class = inc.get("incidentClass", "")
-
-        # Only card incidents
-        if inc_type != "card":
+        if inc.get("incidentType") != "card":
             continue
 
-        card_type = CARD_TYPE_MAP.get(inc_class)
+        card_type = CARD_TYPE_MAP.get(inc.get("incidentClass", ""))
         if not card_type:
             continue
 
-        player = inc.get("player", {})
-        if not player or not player.get("id"):
-            continue   # skip if no player data
+        player = inc.get("player", {}) or {}
+        player_id = player.get("id")
+        if not player_id:
+            continue   # skip cards with no player data
 
-        player_id = player["id"]
-
-        # Determine home/away from isHome flag
         home_away = "home" if inc.get("isHome", False) else "away"
-        club      = match["home_team"] if home_away == "home" else match["away_team"]
+        club      = match["home_team"]    if home_away == "home" else match["away_team"]
         club_id   = match["home_team_id"] if home_away == "home" else match["away_team_id"]
 
-        # Score at time of card
-        score = inc.get("score", {})
+        # Score at time of card — SofaScore nests it differently per version
+        score_raw       = inc.get("score", {}) or {}
+        score_current   = score_raw.get("current", {}) if isinstance(score_raw, dict) else {}
+        score_home      = score_current.get("home", "") if isinstance(score_current, dict) else ""
+        score_away      = score_current.get("away", "") if isinstance(score_current, dict) else ""
 
         cards.append({
-            "season"              : match["season"],
-            "match_date"          : match["match_date"],
-            "match_id"            : match["match_id"],
-            "round"               : match["round"],
-            "home_team"           : match["home_team"],
-            "home_team_id"        : match["home_team_id"],
-            "away_team"           : match["away_team"],
-            "away_team_id"        : match["away_team_id"],
-            # ── Player info — native SofaScore IDs ──
-            "player_id"           : player_id,
-            "player_name"         : player.get("name", ""),
-            "player_slug"         : player.get("slug", ""),
-            "position"            : player.get("position", ""),
-            "club"                : club,
-            "club_id"             : club_id,
-            "home_away"           : home_away,
-            # ── Card details ──
-            "card_type"           : card_type,
-            "minute"              : inc.get("time", ""),
-            "minute_extra"        : inc.get("addedTime", ""),
-            "score_home_at_card"  : score.get("current", {}).get("home", "") if isinstance(score.get("current"), dict) else "",
-            "score_away_at_card"  : score.get("current", {}).get("away", "") if isinstance(score.get("current"), dict) else "",
-            # ── Pre-built photo URL — no extra API call needed ──
-            "player_photo_url"    : f"{BASE}/player/{player_id}/image",
+            "season"             : match["season"],
+            "match_date"         : match["match_date"],
+            "match_id"           : match["match_id"],
+            "round"              : match["round"],
+            "home_team"          : match["home_team"],
+            "home_team_id"       : match["home_team_id"],
+            "away_team"          : match["away_team"],
+            "away_team_id"       : match["away_team_id"],
+            "player_id"          : player_id,
+            "player_name"        : player.get("name", ""),
+            "player_slug"        : player.get("slug", ""),
+            "position"           : player.get("position", ""),
+            "club"               : club,
+            "club_id"            : club_id,
+            "home_away"          : home_away,
+            "card_type"          : card_type,
+            "minute"             : inc.get("time", ""),
+            "minute_extra"       : inc.get("addedTime", ""),
+            "score_home_at_card" : score_home,
+            "score_away_at_card" : score_away,
+            "player_photo_url"   : f"https://api.sofascore.com/api/v1/player/{player_id}/image",
         })
 
     return cards
 
-# ── STEP 4: MAIN LOOP ─────────────────────────────────────────────────────────
+
+# ── STEP 4: MAIN LOOP ───────────────────────────────────────────────────────
+CSV_COLUMNS = [
+    "season","match_date","match_id","round",
+    "home_team","home_team_id","away_team","away_team_id",
+    "player_id","player_name","player_slug","position",
+    "club","club_id","home_away",
+    "card_type","minute","minute_extra",
+    "score_home_at_card","score_away_at_card",
+    "player_photo_url",
+]
+
 def main():
     print("=" * 65)
     print("BRASILEIRÃO SÉRIE A — CARD EVENTS EXTRACTOR")
-    print("SofaScore tournament ID: 325")
+    print("SofaScore tournament ID: 325  |  Seasons: 2018–2023")
     print("=" * 65)
 
     # Load checkpoint (resume support)
@@ -210,20 +222,10 @@ def main():
             processed_match_ids = set(json.load(f))
         print(f"\nResuming — {len(processed_match_ids)} matches already processed.")
 
-    # Open output CSV (append mode for resume)
-    file_exists  = os.path.exists(OUTPUT_FILE)
-    csv_columns  = [
-        "season","match_date","match_id","round",
-        "home_team","home_team_id","away_team","away_team_id",
-        "player_id","player_name","player_slug","position",
-        "club","club_id","home_away",
-        "card_type","minute","minute_extra",
-        "score_home_at_card","score_away_at_card",
-        "player_photo_url",
-    ]
-
+    # Open CSV in append mode (resume-safe)
+    file_exists = os.path.exists(OUTPUT_FILE)
     out_f  = open(OUTPUT_FILE, "a", newline="", encoding="utf-8")
-    writer = csv.DictWriter(out_f, fieldnames=csv_columns)
+    writer = csv.DictWriter(out_f, fieldnames=CSV_COLUMNS)
     if not file_exists:
         writer.writeheader()
 
@@ -234,9 +236,10 @@ def main():
         all_matches = get_match_ids_for_season(season_id, year)
         pending     = [m for m in all_matches if m["match_id"] not in processed_match_ids]
 
-        print(f"\n[3/4] Extracting cards — {year}: {len(pending)} matches to process...")
+        print(f"\n[3/4] Extracting cards — {year}: {len(pending)} matches to process "
+              f"({len(all_matches) - len(pending)} already done)")
 
-        for i, match in enumerate(pending):
+        for i, match in enumerate(pending, start=1):
             cards = extract_cards_from_match(match)
             for c in cards:
                 writer.writerow(c)
@@ -245,66 +248,87 @@ def main():
             total_cards += len(cards)
             processed_match_ids.add(match["match_id"])
 
-            # Save checkpoint every 50 matches
-            if (i + 1) % 50 == 0:
+            # Progress print
+            print(f"  [{year}] Match {i}/{len(pending)} (id={match['match_id']}) "
+                  f"— {len(cards)} cards | total so far: {total_cards}")
+
+            # Checkpoint every 50 matches
+            if i % 50 == 0:
                 with open(CHECKPOINT_FILE, "w") as f:
                     json.dump(list(processed_match_ids), f)
-                print(f"  Checkpoint saved — {i+1}/{len(pending)} done ({total_cards} cards so far)")
+                print(f"  >> Checkpoint saved ({i}/{len(pending)} done, {total_cards} cards)")
 
-            time.sleep(DELAY_MATCH)
+            # Polite delay: 2s base + random jitter up to 0.5s
+            time.sleep(DELAY_MATCH + random.uniform(0, 0.5))
 
-        # Season done — save checkpoint
+        # Season complete — save checkpoint
         with open(CHECKPOINT_FILE, "w") as f:
             json.dump(list(processed_match_ids), f)
         print(f"  ✓ Season {year} complete")
 
     out_f.close()
 
-    # ── SUMMARY ──────────────────────────────────────────────────────────────
+    # ── SUMMARY ──────────────────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print(f"EXTRACTION COMPLETE")
-    print(f"Output file : {OUTPUT_FILE}")
-    print(f"Total cards : {total_cards}")
+    print("EXTRACTION COMPLETE")
+    print(f"Output : {OUTPUT_FILE}")
+    print(f"Cards  : {total_cards}")
     print("=" * 65)
 
-    # Quick breakdown
-    import pandas as pd
-    df = pd.read_csv(OUTPUT_FILE)
-    print(f"\nRows in file      : {len(df)}")
-    print(f"Unique players    : {df['player_id'].nunique()}")
-    print(f"Unique player IDs : confirmed — no name-matching needed\n")
-    print("Cards by type:")
-    print(df["card_type"].value_counts().to_string())
-    print("\nCards by season:")
-    print(df.groupby("season")["card_type"].count().to_string())
+    # Step 5: Validate + save player list
+    validate_and_save_players()
 
-    # Save unique player list with photo URLs ready for classifier
+
+# ── STEP 5: VALIDATION + UNIQUE PLAYER LIST ─────────────────────────────────
+def validate_and_save_players():
+    import pandas as pd
+
+    print("\n[4/4] Validating output and building player list...")
+
+    if not os.path.exists(OUTPUT_FILE):
+        print(f"ERROR: {OUTPUT_FILE} not found!")
+        return
+
+    df = pd.read_csv(OUTPUT_FILE)
+
+    print("\n" + "=" * 55)
+    print("VALIDATION REPORT")
+    print("=" * 55)
+    print(f"Total card rows          : {len(df):,}")
+    print(f"Unique player IDs        : {df['player_id'].nunique():,}")
+    print(f"Rows with missing player  : {df['player_id'].isna().sum()}")
+
+    print("\nCards by type:")
+    print(df["card_type"].value_counts().to_string())
+
+    print("\nCards by season:")
+    print(df.groupby("season")["card_type"].count().rename("cards").to_string())
+
+    # Save unique player list
     player_list = (
         df[["player_id","player_name","player_slug","position","player_photo_url"]]
         .drop_duplicates(subset="player_id")
         .sort_values("player_name")
+        .reset_index(drop=True)
     )
     player_list.to_csv("jogadores_unicos_com_foto.csv", index=False)
-    print(f"\nUnique player list saved: jogadores_unicos_com_foto.csv")
-    print(f"  → {len(player_list)} unique players")
-    print(f"  → photo URLs pre-built, ready for Claude Vision classifier")
-    print("\nNext step: open the classifier app and upload jogadores_unicos_com_foto.csv")
+
+    print(f"\nFile: {OUTPUT_FILE}  → {len(df):,} rows")
+    print(f"File: jogadores_unicos_com_foto.csv → {len(player_list):,} unique players")
+    print("\nDone. Ready for R analysis.")
+
 
 if __name__ == "__main__":
     main()
 
+
 # =============================================================================
 # HOW TO RUN:
-#
-#   pip install requests pandas
+#   pip install cloudscraper pandas openpyxl
 #   python extrair_cartoes_sofascore.py
 #
 # TO RESUME after interruption:
-#   Just re-run the script — checkpoint_processed_matches.json tracks progress
-#
-# RATE LIMITING:
-#   Default: 1.5s between match calls (~45–90 min total)
-#   If you get repeated 429 errors, increase DELAY_MATCH to 2.5
+#   Just re-run — checkpoint_processed_matches.json tracks progress.
 #
 # OUTPUT FILES:
 #   cartoes_brasileirao_2018_2023.csv   ← full dataset, one row per card
